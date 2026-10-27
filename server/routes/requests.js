@@ -1,6 +1,7 @@
 const express = require("express");
 const pool = require("../db");
 const { requireAuth } = require("../middleware/auth");
+const { notify } = require("../utils/notify");
 
 const router = express.Router();
 
@@ -62,6 +63,7 @@ router.post("/", requireAuth, async (req, res) => {
        RETURNING id, item_id, status`,
       [item_id, req.user.id, start_date, return_date, purpose || null]
     );
+        await notify(item.owner_id, `New borrow request for "${item.title}"`, result.rows[0].id);
     res.status(201).json({ request: result.rows[0] });
   } catch (err) {
     console.error(err);
@@ -168,6 +170,18 @@ router.put("/:id/:action", requireAuth, async (req, res) => {
        WHERE id = $2 RETURNING id, status`,
       [rule.to, id]
     );
+        const itemRow = await pool.query("SELECT title FROM items WHERE id = $1", [request.item_id]);
+    const title = itemRow.rows[0].title;
+    const messages = {
+      approve: `Your request for "${title}" was approved`,
+      reject: `Your request for "${title}" was declined`,
+      handover: `"${title}" is now marked as handed over to you`,
+      complete: `The return of "${title}" was confirmed. You can now leave a review`,
+      cancel: `A request for "${title}" was cancelled`,
+      return: `"${title}" was marked as returned. Please confirm you received it`,
+    };
+    const target = rule.who === "owner" ? request.borrower_id : request.owner_id;
+    await notify(target, messages[action], request.id);
     res.json({ request: updated.rows[0] });
   } catch (err) {
     console.error(err);
