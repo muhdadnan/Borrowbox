@@ -2,7 +2,7 @@ const express = require("express");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const pool = require("../db");
-
+const { requireAuth } = require("../middleware/auth");
 const router = express.Router();
 
 // REGISTER: create a new user
@@ -63,6 +63,24 @@ router.post("/login", async (req, res) => {
       token,
       user: { id: user.id, name: user.name, email: user.email, role: user.role },
     });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Something went wrong" });
+  }
+});
+
+// ME: return the logged-in user's details
+router.get("/me", requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, name, email, phone, location, role, is_verified, trust_score, created_at
+       FROM users WHERE id = $1`,
+      [req.user.id]
+    );
+    if (!result.rows[0]) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    res.json({ user: result.rows[0] });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Something went wrong" });
