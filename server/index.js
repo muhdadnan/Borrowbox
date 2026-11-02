@@ -3,16 +3,34 @@ const cors = require("cors");
 require("dotenv").config();
 const pool = require("./db");
 
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+
 const app = express();
 
-app.use(cors());
-app.use(express.json());
+app.set("trust proxy", 1);
+app.use(helmet());
+app.use(
+  cors({
+    origin: (process.env.FRONTEND_URL || "http://localhost:5173").split(","),
+  })
+);
+app.use(express.json({ limit: "100kb" }));
+app.use(
+  "/api/auth",
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 100,
+    message: { error: "Too many attempts, please try again in a few minutes" },
+  })
+);
 app.use("/api/auth", require("./routes/auth"));
 app.use("/api/categories", require("./routes/categories"));
 app.use("/api/items", require("./routes/items"));
 app.use("/api/requests", require("./routes/requests"));
 app.use("/api/reviews", require("./routes/reviews"));
 app.use("/api/notifications", require("./routes/notifications"));
+app.use("/api/uploads", require("./routes/uploads"));
 
 app.get("/", (req, res) => {
   res.json({ message: "BorrowBox API is running" });

@@ -27,7 +27,7 @@ router.get("/", async (req, res) => {
   }
 
   const sql = `
-    SELECT i.id, i.title, i.item_condition, i.location, i.deposit_amount,
+    SELECT i.id, i.owner_id, i.title, i.item_condition, i.location, i.deposit_amount,
            i.max_days, i.is_available, c.name AS category,
            u.name AS owner_name, u.trust_score AS owner_trust,
            (SELECT image_url FROM item_images WHERE item_id = i.id ORDER BY id LIMIT 1) AS image_url
@@ -111,7 +111,10 @@ router.post("/", requireAuth, async (req, res) => {
     );
     const item = result.rows[0];
 
-    for (const url of image_urls || []) {
+        const safeUrls = (Array.isArray(image_urls) ? image_urls : [])
+      .filter((u) => typeof u === "string" && u.startsWith("https://res.cloudinary.com/"))
+      .slice(0, 5);
+    for (const url of safeUrls) {
       await pool.query("INSERT INTO item_images (item_id, image_url) VALUES ($1, $2)", [item.id, url]);
     }
     res.status(201).json({ item });
