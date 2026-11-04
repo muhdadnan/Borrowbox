@@ -31,6 +31,7 @@ app.use("/api/requests", require("./routes/requests"));
 app.use("/api/reviews", require("./routes/reviews"));
 app.use("/api/notifications", require("./routes/notifications"));
 app.use("/api/uploads", require("./routes/uploads"));
+app.use("/api/chats", require("./routes/chats"));
 
 app.get("/", (req, res) => {
   res.json({ message: "BorrowBox API is running" });
