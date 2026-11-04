@@ -2,6 +2,89 @@ import { useEffect, useRef, useState } from 'react'
 import './App.css'
 
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:5000/api'
+const GOOGLE_MAPS_API_KEY = import.meta.env.VITE_GOOGLE_MAPS_API_KEY || ''
+let googleMapsApiPromise = null
+const geocodedLocations = new Map()
+
+function loadGoogleMapsApi() {
+  if (window.google?.maps?.Geocoder) return Promise.resolve(window.google.maps)
+  if (!GOOGLE_MAPS_API_KEY) {
+    return Promise.reject(new Error('Nearby search needs a Google Maps API key. Add VITE_GOOGLE_MAPS_API_KEY to client/.env.local.'))
+  }
+  if (!googleMapsApiPromise) {
+    googleMapsApiPromise = new Promise((resolve, reject) => {
+      const script = document.createElement('script')
+      script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(GOOGLE_MAPS_API_KEY)}&v=weekly`
+      script.async = true
+      script.dataset.borrowboxGoogleMaps = 'true'
+      script.onload = () => {
+        if (window.google?.maps?.Geocoder) {
+          resolve(window.google.maps)
+        } else {
+          googleMapsApiPromise = null
+          script.remove()
+          reject(new Error('Google Maps loaded without its geocoding service. Check the enabled APIs for your key.'))
+        }
+      }
+      script.onerror = () => {
+        googleMapsApiPromise = null
+        script.remove()
+        reject(new Error('Google Maps could not load. Check the API key, enabled services, and connection.'))
+      }
+      document.head.appendChild(script)
+    })
+  }
+  return googleMapsApiPromise
+}
+
+function geocodeLocation(location, geocoder) {
+  const cacheKey = location.trim().toLowerCase()
+  if (!geocodedLocations.has(cacheKey)) {
+    const request = geocoder.geocode({ address: location })
+      .then(({ results }) => {
+        if (!results.length) throw new Error('No matching location')
+        const point = results[0].geometry.location
+        return { latitude: point.lat(), longitude: point.lng() }
+      })
+      .catch((error) => {
+        geocodedLocations.delete(cacheKey)
+        throw error
+      })
+    geocodedLocations.set(cacheKey, request)
+  }
+  return geocodedLocations.get(cacheKey)
+}
+
+function getBrowserLocation() {
+  return new Promise((resolve, reject) => {
+    navigator.geolocation.getCurrentPosition(
+      ({ coords }) => resolve({ latitude: coords.latitude, longitude: coords.longitude }),
+      (error) => {
+        const message = error.code === error.PERMISSION_DENIED
+          ? 'Location permission was denied. Allow location access in your browser to find nearby items.'
+          : error.code === error.TIMEOUT
+            ? 'Your location could not be found in time. Try again.'
+            : 'Your location is unavailable. Check your device location settings and try again.'
+        reject(new Error(message))
+      },
+      { enableHighAccuracy: false, maximumAge: 60000, timeout: 10000 }
+    )
+  })
+}
+
+function distanceBetween(first, second) {
+  const radians = (degrees) => degrees * Math.PI / 180
+  const latitudeDifference = radians(second.latitude - first.latitude)
+  const longitudeDifference = radians(second.longitude - first.longitude)
+  const value = Math.sin(latitudeDifference / 2) ** 2
+    + Math.cos(radians(first.latitude)) * Math.cos(radians(second.latitude))
+    * Math.sin(longitudeDifference / 2) ** 2
+  return 6371 * 2 * Math.atan2(Math.sqrt(value), Math.sqrt(1 - value))
+}
+
+function formatDistance(distance) {
+  return distance < 1 ? `${Math.round(distance * 1000)} m away` : `${distance.toFixed(1)} km away`
+}
 
 async function apiRequest(path, { token, ...options } = {}) {
   const headers = { ...options.headers }
@@ -232,6 +315,10 @@ function App() {
   const [infoPage, setInfoPage] = useState(null)
   const [toasts, setToasts] = useState([])
   const [sortBy, setSortBy] = useState('newest')
+  const [nearbyDistances, setNearbyDistances] = useState({})
+  const [nearbyBusy, setNearbyBusy] = useState(false)
+  const [nearbyMessage, setNearbyMessage] = useState('')
+  const [nearbyError, setNearbyError] = useState('')
   const [galleryIndex, setGalleryIndex] = useState(0)
   const [lightboxOpen, setLightboxOpen] = useState(false)
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
@@ -247,6 +334,7 @@ function App() {
   const dialogReturnFocusRef = useRef(new Map())
   const sessionExpiryHandled = useRef(false)
   const listingPreviewUrlsRef = useRef(new Set())
+  const nearbyRunRef = useRef(0)
 
   useEffect(() => {
     const previewUrls = listingPreviewUrlsRef.current
@@ -262,6 +350,85 @@ function App() {
     window.setTimeout(() => {
       setToasts((current) => current.filter((entry) => entry.id !== toast.id))
     }, 3600)
+  }
+
+  function resetNearbyResults() {
+    nearbyRunRef.current += 1
+    setNearbyDistances({})
+    setNearbyBusy(false)
+    setNearbyMessage('')
+    setNearbyError('')
+    setSortBy((current) => current === 'distance' ? 'newest' : current)
+  }
+
+  async function findNearbyItems() {
+    const runId = nearbyRunRef.current + 1
+    nearbyRunRef.current = runId
+    if (!GOOGLE_MAPS_API_KEY) {
+      setNearbyMessage('')
+      setNearbyError('Nearby search needs a Google Maps API key. Add VITE_GOOGLE_MAPS_API_KEY to client/.env.local.')
+      return
+    }
+    setNearbyBusy(true)
+    setNearbyError('')
+    setNearbyMessage('Finding your location and estimating distances...')
+    try {
+      if (!navigator.geolocation) {
+        throw new Error('Location access is not available in this browser.')
+      }
+      const origin = await getBrowserLocation()
+      if (nearbyRunRef.current !== runId) return
+      const maps = await loadGoogleMapsApi()
+      if (nearbyRunRef.current !== runId) return
+
+      const locations = [...new Set(items
+        .map((item) => String(item.location || '').trim())
+        .filter((itemLocation) => itemLocation && !/shared after request/i.test(itemLocation)))]
+      if (locations.length === 0) {
+        setNearbyMessage('')
+        setNearbyError('These listings do not include locations that can be used to calculate distances.')
+        return
+      }
+
+      const geocoder = new maps.Geocoder()
+      const coordinatesByLocation = new Map()
+      let nextLocationIndex = 0
+      let failedLocations = 0
+      const workerCount = Math.min(4, locations.length)
+      await Promise.all(Array.from({ length: workerCount }, async () => {
+        while (nextLocationIndex < locations.length) {
+          const currentLocation = locations[nextLocationIndex]
+          nextLocationIndex += 1
+          try {
+            coordinatesByLocation.set(currentLocation, await geocodeLocation(currentLocation, geocoder))
+          } catch {
+            failedLocations += 1
+          }
+        }
+      }))
+      if (nearbyRunRef.current !== runId) return
+
+      const distances = Object.fromEntries(items.flatMap((item) => {
+        const point = coordinatesByLocation.get(String(item.location || '').trim())
+        return point ? [[item.id, distanceBetween(origin, point)]] : []
+      }))
+      if (Object.keys(distances).length === 0) {
+        setNearbyMessage('')
+        setNearbyError('Could not find distances for these listings. Check that the Google Geocoding API is enabled and the listing locations are searchable.')
+        return
+      }
+
+      setNearbyDistances(distances)
+      setSortBy('distance')
+      setNearbyMessage(`Distances are approximate. Google Maps receives listing location text to geocode.${failedLocations ? ` Could not locate ${failedLocations} listing location${failedLocations === 1 ? '' : 's'}.` : ''}`)
+    } catch (nearbyRequestError) {
+      if (nearbyRunRef.current === runId) {
+        setNearbyMessage('')
+        setNearbyError(nearbyRequestError.message)
+      }
+    } finally {
+      if (nearbyRunRef.current === runId) setNearbyBusy(false)
+    }
   }
 
   function updateFieldErrors(setErrors, event) {
@@ -1112,6 +1279,13 @@ function App() {
     : Math.max(1, requestDateDifference)
   const galleryImages = detail && (detail.images && detail.images.length ? detail.images : detail.image_url ? [detail.image_url] : [])
   const sortedItems = [...items].sort((first, second) => {
+    if (sortBy === 'distance') {
+      const firstDistance = nearbyDistances[first.id]
+      const secondDistance = nearbyDistances[second.id]
+      if (firstDistance === undefined && secondDistance !== undefined) return 1
+      if (secondDistance === undefined && firstDistance !== undefined) return -1
+      if (firstDistance !== undefined && secondDistance !== undefined) return firstDistance - secondDistance
+    }
     if (sortBy === 'deposit-low') return Number(first.deposit_amount || 0) - Number(second.deposit_amount || 0)
     if (sortBy === 'deposit-high') return Number(second.deposit_amount || 0) - Number(first.deposit_amount || 0)
     return Number(second.id || 0) - Number(first.id || 0)
@@ -1222,11 +1396,11 @@ function App() {
               <div className="search-panel">
                 <label className="search-field">
                   <span className="field-label">What are you looking for?</span>
-                  <span className="input-wrap"><span aria-hidden="true">⌕</span><input type="search" autoComplete="off" value={search} onChange={(event) => { setLoading(true); setError(''); setSearch(event.target.value) }} placeholder="Camera, drill, tent..." /></span>
+                  <span className="input-wrap"><span aria-hidden="true">⌕</span><input type="search" autoComplete="off" value={search} onChange={(event) => { resetNearbyResults(); setLoading(true); setError(''); setSearch(event.target.value) }} placeholder="Camera, drill, tent..." /></span>
                 </label>
                 <label className="search-field location-field">
                   <span className="field-label">Where?</span>
-                  <span className="input-wrap"><span aria-hidden="true">⌖</span><input type="text" autoComplete="address-level2" value={location} onChange={(event) => { setLoading(true); setError(''); setLocation(event.target.value) }} placeholder="City or neighborhood" /></span>
+                  <span className="input-wrap"><span aria-hidden="true">⌖</span><input type="text" autoComplete="address-level2" value={location} onChange={(event) => { resetNearbyResults(); setLoading(true); setError(''); setLocation(event.target.value) }} placeholder="City or neighborhood" /></span>
                 </label>
                 <a className="search-button" href="#listings">Find an item <span aria-hidden="true">→</span></a>
               </div>
@@ -1238,7 +1412,7 @@ function App() {
                 <div className="listing-controls">
                   <label className="category-select-label">
                     <span>Category</span>
-                    <select value={category} onChange={(event) => { setLoading(true); setError(''); setCategory(event.target.value) }}>
+                    <select value={category} onChange={(event) => { resetNearbyResults(); setLoading(true); setError(''); setCategory(event.target.value) }}>
                       <option value="">All categories</option>
                       {categories.map((entry) => <option key={entry.id} value={entry.id}>{entry.name}</option>)}
                     </select>
@@ -1249,10 +1423,16 @@ function App() {
                       <option value="newest">Newest</option>
                       <option value="deposit-low">Deposit low to high</option>
                       <option value="deposit-high">Deposit high to low</option>
+                      <option value="distance" disabled={Object.keys(nearbyDistances).length === 0}>Nearest first</option>
                     </select>
                   </label>
+                  <button className="nearby-button" type="button" onClick={findNearbyItems} disabled={nearbyBusy}>
+                    {nearbyBusy ? 'Finding nearby…' : 'Find nearby'}
+                  </button>
                 </div>
               </div>
+              {nearbyMessage && <p className="nearby-message" role="status">{nearbyMessage}</p>}
+              {nearbyError && <p className="nearby-error" role="alert">{nearbyError}</p>}
               {error ? (
                 <div className="status-panel error-panel" role="alert"><p>{error}</p><button type="button" onClick={() => { setError(''); setLoading(true); setRetry((value) => value + 1) }}>Try again</button></div>
               ) : loading ? (
@@ -1284,7 +1464,7 @@ function App() {
                       </span>
                       <span className="item-info">
                         <span className="item-title-line"><strong>{item.title}</strong><span className="condition">{item.item_condition || 'Good'}</span></span>
-                        <span className="item-location"><span aria-hidden="true">⌖</span> {item.location || 'Location shared after request'}</span>
+                        <span className="item-location"><span aria-hidden="true">⌖</span> {item.location || 'Location shared after request'}{nearbyDistances[item.id] !== undefined && <span className="item-distance">{formatDistance(nearbyDistances[item.id])}</span>}</span>
                         <span className="item-footer"><span><strong>${Number(item.deposit_amount || 0).toFixed(0)}</strong> deposit</span><span>Up to {item.max_days || 7} days</span></span>
                         <span className="owner-line">Shared by <strong>{item.owner_name}</strong>{item.owner_trust ? <span className="trust-score"> · {Number(item.owner_trust).toFixed(1)} ★</span> : null}</span>
                       </span>
